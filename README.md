@@ -31,7 +31,7 @@ Deploy n8n workflow automation tool on Amazon ECS using AWS CDK with Python.
 ### 1. Deploy Infrastructure
 
 ```bash
-./scripts/deploy.sh
+make deploy
 ```
 
 This will:
@@ -43,7 +43,7 @@ This will:
 ### 2. Start N8n
 
 ```bash
-./scripts/start.sh
+make start
 ```
 
 This will:
@@ -61,21 +61,26 @@ Open the URL displayed after starting the service. You can now:
 ### 4. Stop N8n (Save Costs)
 
 ```bash
-./scripts/stop.sh
+make stop
 ```
 
 This scales the service to 0 tasks, stopping compute charges while preserving your data.
 
 ## Management Commands
 
-| Command | Description |
-|---------|-------------|
-| `./scripts/deploy.sh` | Deploy infrastructure |
-| `./scripts/start.sh` | Start n8n service |
-| `./scripts/stop.sh` | Stop n8n service |
-| `./scripts/status.sh` | Check service status |
-| `./scripts/logs.sh` | View real-time logs |
-| `./scripts/destroy.sh` | Remove all infrastructure |
+You can use either Makefile targets or direct script execution:
+
+| Make Target | Script | Description |
+|-------------|--------|-------------|
+| `make deploy` | `./scripts/deploy.sh` | Deploy infrastructure |
+| `make start` | `./scripts/start.sh` | Start n8n service |
+| `make stop` | `./scripts/stop.sh` | Stop n8n service |
+| `make status` | `./scripts/status.sh` | Check service status |
+| `make logs` | `./scripts/logs.sh` | View real-time logs |
+| `make destroy` | `./scripts/destroy.sh` | Remove all infrastructure |
+| `make clean` | - | Clean up local build artifacts |
+
+**Tip**: Run `make` or `make help` to see all available targets.
 
 ## AWS Console Management
 
@@ -103,7 +108,7 @@ Your n8n data is stored in Amazon EFS and persists across:
 - Service stops/starts
 - Task replacements
 
-Data is only lost when you run `./scripts/destroy.sh`.
+Data is only lost when you run `make destroy`.
 
 ## Costs
 
@@ -127,18 +132,18 @@ When stopped (0 tasks):
 
 ### Service won't start
 ```bash
-./scripts/logs.sh
+make logs
 ```
 
 ### Check service status
 ```bash
-./scripts/status.sh
+make status
 ```
 
 ### Reset deployment
 ```bash
-./scripts/destroy.sh
-./scripts/deploy.sh
+make destroy
+make deploy
 ```
 
 ## Customization
