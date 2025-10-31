@@ -2,12 +2,12 @@ from aws_cdk import (
     Stack,
     aws_ec2 as ec2,
     aws_ecs as ecs,
-    aws_elasticloadbalancingv2 as elbv2,
     aws_efs as efs,
     aws_logs as logs,
     aws_iam as iam,
+    aws_events as events,
+    aws_events_targets as targets,
     CfnOutput,
-    Duration,
     RemovalPolicy
 )
 from constructs import Construct
@@ -18,58 +18,32 @@ class N8nStack(Stack):
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        # VPC
+        # VPC - Simplified with public subnets only (no NAT gateway needed)
         self.vpc = ec2.Vpc(
             self, "N8nVPC",
             max_azs=2,
-            nat_gateways=1,
+            nat_gateways=0,  # No NAT gateway needed - saves ~$32/month
             ip_addresses=ec2.IpAddresses.cidr("10.0.0.0/16"),
             subnet_configuration=[
                 ec2.SubnetConfiguration(
                     name="Public",
                     subnet_type=ec2.SubnetType.PUBLIC,
                     cidr_mask=24
-                ),
-                ec2.SubnetConfiguration(
-                    name="Private",
-                    subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS,
-                    cidr_mask=24
                 )
             ]
         )
 
         # Security Groups
-        self.alb_security_group = ec2.SecurityGroup(
-            self, "ALBSecurityGroup",
-            vpc=self.vpc,
-            description="Security group for N8n ALB",
-            allow_all_outbound=True
-        )
-
-        self.alb_security_group.add_ingress_rule(
-            ec2.Peer.any_ipv4(),
-            ec2.Port.tcp(80),
-            "Allow HTTP traffic"
-        )
-
-        self.alb_security_group.add_ingress_rule(
-            ec2.Peer.any_ipv4(),
-            ec2.Port.tcp(443),
-            "Allow HTTPS traffic"
-        )
-
+        # ECS Security Group - No inbound rules needed (access via Session Manager)
         self.ecs_security_group = ec2.SecurityGroup(
             self, "ECSSecurityGroup",
             vpc=self.vpc,
             description="Security group for N8n ECS tasks",
-            allow_all_outbound=True
+            allow_all_outbound=True  # Allows pulling images, API calls, etc.
         )
 
-        self.ecs_security_group.add_ingress_rule(
-            self.alb_security_group,
-            ec2.Port.tcp(5678),
-            "Allow traffic from ALB to N8n"
-        )
+        # Note: No inbound rules needed. Access is via AWS Systems Manager Session Manager
+        # which uses the SSM agent and doesn't require open ports
 
         self.efs_security_group = ec2.SecurityGroup(
             self, "EFSSecurityGroup",
@@ -100,6 +74,14 @@ class N8nStack(Stack):
             container_insights=True
         )
 
+        # CloudWatch Log Group
+        self.log_group = logs.LogGroup(
+            self, "N8nLogGroup",
+            log_group_name="/ecs/n8n",
+            removal_policy=RemovalPolicy.DESTROY,
+            retention=logs.RetentionDays.ONE_WEEK
+        )
+
         # Task Execution Role
         self.execution_role = iam.Role(
             self, "N8nExecutionRole",
@@ -111,18 +93,30 @@ class N8nStack(Stack):
             ]
         )
 
-        # Task Role
+        # Task Role - with Session Manager permissions
         self.task_role = iam.Role(
             self, "N8nTaskRole",
             assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com")
         )
 
-        # CloudWatch Log Group
-        self.log_group = logs.LogGroup(
-            self, "N8nLogGroup",
-            log_group_name="/ecs/n8n",
-            removal_policy=RemovalPolicy.DESTROY,
-            retention=logs.RetentionDays.ONE_WEEK
+        # Add Session Manager permissions for ECS Exec
+        self.task_role.add_managed_policy(
+            iam.ManagedPolicy.from_aws_managed_policy_name(
+                "AmazonSSMManagedInstanceCore"
+            )
+        )
+
+        # Allow task to write to CloudWatch Logs for Session Manager
+        self.task_role.add_to_policy(
+            iam.PolicyStatement(
+                effect=iam.Effect.ALLOW,
+                actions=[
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents",
+                    "logs:DescribeLogStreams"
+                ],
+                resources=[f"{self.log_group.log_group_arn}:*"]
+            )
         )
 
         # Task Definition
@@ -175,41 +169,7 @@ class N8nStack(Stack):
             )
         )
 
-        # Application Load Balancer
-        self.alb = elbv2.ApplicationLoadBalancer(
-            self, "N8nALB",
-            vpc=self.vpc,
-            internet_facing=True,
-            security_group=self.alb_security_group
-        )
-
-        # Target Group
-        self.target_group = elbv2.ApplicationTargetGroup(
-            self, "N8nTargetGroup",
-            vpc=self.vpc,
-            port=5678,
-            protocol=elbv2.ApplicationProtocol.HTTP,
-            target_type=elbv2.TargetType.IP,
-            health_check=elbv2.HealthCheck(
-                enabled=True,
-                healthy_http_codes="200",
-                interval=Duration.seconds(30),
-                path="/",
-                protocol=elbv2.Protocol.HTTP,
-                timeout=Duration.seconds(10),
-                unhealthy_threshold_count=3
-            )
-        )
-
-        # ALB Listener
-        self.listener = self.alb.add_listener(
-            "N8nListener",
-            port=80,
-            protocol=elbv2.ApplicationProtocol.HTTP,
-            default_target_groups=[self.target_group]
-        )
-
-        # ECS Service
+        # ECS Service - Running in public subnet with Session Manager access
         self.service = ecs.FargateService(
             self, "N8nService",
             cluster=self.cluster,
@@ -217,35 +177,51 @@ class N8nStack(Stack):
             desired_count=0,  # Start with 0, scale up when needed
             security_groups=[self.ecs_security_group],
             vpc_subnets=ec2.SubnetSelection(
-                subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
+                subnet_type=ec2.SubnetType.PUBLIC
             ),
-            assign_public_ip=False
+            assign_public_ip=True,  # Required for public subnet to pull images and access internet
+            enable_execute_command=True  # Enable ECS Exec for Session Manager access
         )
 
-        # Register service with target group
-        self.service.attach_to_application_target_group(self.target_group)
+        # Optional: EventBridge rule for scheduled startup
+        # Uncomment to auto-start service on a schedule (e.g., Monday 8 AM UTC)
+        # self.start_rule = events.Rule(
+        #     self, "StartN8nRule",
+        #     schedule=events.Schedule.cron(
+        #         minute="0",
+        #         hour="8",
+        #         week_day="MON"
+        #     ),
+        #     description="Start n8n service on schedule"
+        # )
+        # self.start_rule.add_target(
+        #     targets.EcsTask(
+        #         cluster=self.cluster,
+        #         task_definition=self.task_definition,
+        #         subnet_selection=ec2.SubnetSelection(
+        #             subnet_type=ec2.SubnetType.PUBLIC
+        #         ),
+        #         assign_public_ip=True
+        #     )
+        # )
 
         # Outputs
         CfnOutput(
-            self, "LoadBalancerDNS",
-            value=self.alb.load_balancer_dns_name,
-            description="DNS name of the load balancer"
-        )
-
-        CfnOutput(
-            self, "N8nURL",
-            value=f"http://{self.alb.load_balancer_dns_name}",
-            description="URL to access N8n"
-        )
-
-        CfnOutput(
             self, "ClusterName",
             value=self.cluster.cluster_name,
-            description="ECS Cluster name"
+            description="ECS Cluster name (use for Session Manager access)",
+            export_name=f"{self.stack_name}-ClusterName"
         )
 
         CfnOutput(
             self, "ServiceName",
             value=self.service.service_name,
-            description="ECS Service name"
+            description="ECS Service name (use for Session Manager access)",
+            export_name=f"{self.stack_name}-ServiceName"
+        )
+
+        CfnOutput(
+            self, "AccessInstructions",
+            value="Use 'make connect' or AWS Session Manager to access n8n",
+            description="How to access n8n (no ALB - Session Manager only)"
         )
